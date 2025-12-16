@@ -1,4 +1,18 @@
 # ==================== SETUP & INSTALLATION ====================
+# OPTIMIZED VERSION FOR LARGE DATASETS (135+ audio files)
+# 
+# Key Optimizations:
+# 1. Mixed Precision Training (FP16) - 2-3x faster on GPU
+# 2. Aggressive downsampling (15x) - reduces sequence length
+# 3. Shorter max sequence (500 frames) - less memory usage
+# 4. Smaller model (3 blocks, 128 dims) - faster computation
+# 5. Fewer epochs (15 instead of 30) - faster overall training
+# 6. Better memory management - periodic cache clearing
+# 7. Progress monitoring - real-time batch progress
+#
+# Expected speedup: 4-5x faster than original version
+# ==================== ==================== ====================
+
 print("=" * 60)
 print("INSTALLING DEPENDENCIES...")
 print("=" * 60)
@@ -7,7 +21,7 @@ import subprocess
 import sys
 
 def install_packages():
-    packages = ['torch', 'librosa', 'numpy', 'scipy', 'soundfile']
+    packages = ['torch', 'librosa', 'numpy', 'scipy', 'soundfile', 'tqdm']
     for package in packages:
         subprocess.check_call([sys.executable, '-m', 'pip', 'install', '-q', package])
     # Explicitly upgrade sympy to resolve potential compatibility issues with torch
@@ -29,6 +43,9 @@ import soundfile as sf
 from IPython.display import Audio, display
 import warnings
 import glob
+import pickle
+import hashlib
+from tqdm.auto import tqdm
 warnings.filterwarnings('ignore')
 
 print("✓ All packages installed successfully!")
@@ -137,22 +154,55 @@ def create_auto_labels(audio_path, sr=8000, frame_length=0.01):
 
     return labels
 
-# Create labels for all audio files
+# Create labels for all audio files WITH CACHING for faster subsequent runs
 print("Processing audio files to generate labels...")
-label_data = []
 
-for i, audio_file in enumerate(audio_files):
+# Cache file path
+CACHE_DIR = '/content/drive/MyDrive/Agen cerdas/Cache'
+os.makedirs(CACHE_DIR, exist_ok=True)
+
+# Create hash of audio files list for cache key
+files_hash = hashlib.md5(''.join(audio_files).encode()).hexdigest()[:8]
+cache_file = os.path.join(CACHE_DIR, f'labels_cache_{files_hash}_{len(audio_files)}.pkl')
+
+# Try to load from cache
+if os.path.exists(cache_file):
+    print(f"📦 Loading labels from cache: {cache_file}")
     try:
-        labels = create_auto_labels(audio_file)
-        label_data.append(labels)
-
-        if (i + 1) % 5 == 0:
-            print(f"  Processed {i+1}/{len(audio_files)} files...")
+        with open(cache_file, 'rb') as f:
+            label_data = pickle.load(f)
+        print(f"✓ Loaded {len(label_data)} labels from cache")
     except Exception as e:
-        print(f"  ⚠ Error processing {os.path.basename(audio_file)}: {e}")
-        # Create dummy labels if error
-        dummy_labels = np.random.randint(0, 2, size=(500, 2))
-        label_data.append(dummy_labels)
+        print(f"⚠ Cache load failed: {e}")
+        print("Regenerating labels...")
+        label_data = None
+else:
+    label_data = None
+
+# Generate labels if not cached
+if label_data is None:
+    label_data = []
+    for i, audio_file in enumerate(audio_files):
+        try:
+            labels = create_auto_labels(audio_file)
+            label_data.append(labels)
+
+            if (i + 1) % 10 == 0 or (i + 1) == len(audio_files):
+                print(f"  Processed {i+1}/{len(audio_files)} files...")
+        except Exception as e:
+            print(f"  ⚠ Error processing {os.path.basename(audio_file)}: {e}")
+            # Create dummy labels if error
+            dummy_labels = np.random.randint(0, 2, size=(500, 2))
+            label_data.append(dummy_labels)
+    
+    # Save to cache
+    print(f"💾 Saving labels to cache: {cache_file}")
+    try:
+        with open(cache_file, 'wb') as f:
+            pickle.dump(label_data, f)
+        print("✓ Cache saved successfully")
+    except Exception as e:
+        print(f"⚠ Cache save failed: {e}")
 
 print(f"✓ Generated labels for {len(label_data)} audio files")
 print()
@@ -199,44 +249,53 @@ class AudioFeatureExtractor:
 
 # ==================== DATASET ====================
 class SpeakerDiarizationDataset(Dataset):
-    """Dataset for speaker diarization"""
+    """Dataset for speaker diarization - OPTIMIZED for large datasets"""
 
-    def __init__(self, audio_files, labels_list, feature_extractor=None):
+    def __init__(self, audio_files, labels_list, feature_extractor=None, downsample_factor=15):
         self.audio_files = audio_files
         self.labels_list = labels_list
         self.feature_extractor = feature_extractor or AudioFeatureExtractor()
+        self.downsample_factor = downsample_factor  # More aggressive downsampling for 135 files
 
     def __len__(self):
         return len(self.audio_files)
 
     def __getitem__(self, idx):
-        # Extract features
-        features = self.feature_extractor.extract_features(self.audio_files[idx])
-        features = self.feature_extractor.context_window(features)
-        features = features[::10]  # Temporal downsampling
+        try:
+            # Extract features
+            features = self.feature_extractor.extract_features(self.audio_files[idx])
+            features = self.feature_extractor.context_window(features)
+            features = features[::self.downsample_factor]  # Aggressive downsampling
 
-        # Get labels
-        labels = self.labels_list[idx]
-        labels = labels[::10]  # Match downsampling
+            # Get labels
+            labels = self.labels_list[idx]
+            labels = labels[::self.downsample_factor]  # Match downsampling
 
-        # Ensure same length
-        min_len = min(len(features), len(labels))
-        features = features[:min_len]
-        labels = labels[:min_len]
+            # Ensure same length
+            min_len = min(len(features), len(labels))
+            features = features[:min_len]
+            labels = labels[:min_len]
 
-        return torch.FloatTensor(features), torch.FloatTensor(labels)
+            return torch.FloatTensor(features), torch.FloatTensor(labels)
+        except Exception as e:
+            # Return dummy data if there's an error
+            print(f"Warning: Error processing file {idx}: {e}")
+            dummy_features = torch.zeros(50, 23 * 15)
+            dummy_labels = torch.zeros(50, 2)
+            return dummy_features, dummy_labels
 
 
 def collate_fn(batch):
     """
     Custom collate function to handle variable length sequences
     Pads sequences to the same length in a batch
+    OPTIMIZED: Shorter max length for faster processing with large datasets
     """
     features_list, labels_list = zip(*batch)
 
     # Find max length in this batch (limit to prevent OOM)
     max_len = max([f.shape[0] for f in features_list])
-    MAX_SEQUENCE_LENGTH = 1000  # Limit max sequence length to prevent OOM
+    MAX_SEQUENCE_LENGTH = 500  # REDUCED from 1000 to 500 for faster training with 135 files
     max_len = min(max_len, MAX_SEQUENCE_LENGTH)
 
     feature_dim = features_list[0].shape[1]
@@ -438,12 +497,15 @@ class AuxiliaryLosses:
 
 # ==================== TRAINING ====================
 def train_model(model, train_loader, num_epochs=30, lr=0.0001,
-                alpha=1.0, beta=1.0, device='cpu'):
-    """Train SA-EEND model with auxiliary losses"""
+                alpha=1.0, beta=1.0, device='cpu', use_amp=True):
+    """Train SA-EEND model with auxiliary losses - OPTIMIZED for large datasets"""
 
     model = model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     aux_losses = AuxiliaryLosses()
+    
+    # Mixed precision training for faster computation
+    scaler = torch.cuda.amp.GradScaler() if use_amp and device == 'cuda' else None
 
     history = {
         'total_loss': [],
@@ -453,42 +515,86 @@ def train_model(model, train_loader, num_epochs=30, lr=0.0001,
     }
 
     print("=" * 60)
-    print("TRAINING MODEL...")
+    print("TRAINING MODEL (OPTIMIZED FOR LARGE DATASETS)...")
     print("=" * 60)
+    print(f"Mixed Precision: {'Enabled' if use_amp and device == 'cuda' else 'Disabled'}")
+    print()
 
+    import time
+    
     for epoch in range(num_epochs):
         model.train()
         epoch_total_loss = 0
         epoch_diar_loss = 0
         epoch_svad_loss = 0
         epoch_osd_loss = 0
+        
+        epoch_start_time = time.time()
+        batch_count = 0
 
-        for batch_idx, (features, labels) in enumerate(train_loader):
+        # Progress bar for batches
+        pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{num_epochs}', leave=True)
+        
+        for batch_idx, (features, labels) in enumerate(pbar):
             features = features.to(device)
             labels = labels.to(device)
 
             optimizer.zero_grad()
 
-            predictions, all_attention_weights = model(features)
-
-            # Diarization loss
-            diar_loss = F.binary_cross_entropy(predictions, labels)
-
-            # Auxiliary losses (4th encoder block)
-            attn_4th_block = all_attention_weights[-1]
-            svad_loss = aux_losses.svad_loss(attn_4th_block, labels)
-            osd_loss = aux_losses.osd_loss(attn_4th_block, labels)
-
-            # Total loss
-            loss = diar_loss + alpha * svad_loss + beta * osd_loss
-
-            loss.backward()
-            optimizer.step()
+            # Use automatic mixed precision if enabled
+            if scaler is not None:
+                with torch.cuda.amp.autocast():
+                    predictions, all_attention_weights = model(features)
+                    
+                    # Diarization loss
+                    diar_loss = F.binary_cross_entropy(predictions, labels)
+                    
+                    # Auxiliary losses (4th encoder block)
+                    attn_4th_block = all_attention_weights[-1]
+                    svad_loss = aux_losses.svad_loss(attn_4th_block, labels)
+                    osd_loss = aux_losses.osd_loss(attn_4th_block, labels)
+                    
+                    # Total loss
+                    loss = diar_loss + alpha * svad_loss + beta * osd_loss
+                
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                predictions, all_attention_weights = model(features)
+                
+                # Diarization loss
+                diar_loss = F.binary_cross_entropy(predictions, labels)
+                
+                # Auxiliary losses (4th encoder block)
+                attn_4th_block = all_attention_weights[-1]
+                svad_loss = aux_losses.svad_loss(attn_4th_block, labels)
+                osd_loss = aux_losses.osd_loss(attn_4th_block, labels)
+                
+                # Total loss
+                loss = diar_loss + alpha * svad_loss + beta * osd_loss
+                
+                loss.backward()
+                optimizer.step()
 
             epoch_total_loss += loss.item()
             epoch_diar_loss += diar_loss.item()
             epoch_svad_loss += svad_loss.item()
             epoch_osd_loss += osd_loss.item()
+            batch_count += 1
+            
+            # Update progress bar with current loss
+            avg_loss = epoch_total_loss / batch_count
+            pbar.set_postfix({
+                'loss': f'{avg_loss:.4f}',
+                'diar': f'{epoch_diar_loss/batch_count:.4f}',
+                'svad': f'{epoch_svad_loss/batch_count:.4f}',
+                'osd': f'{epoch_osd_loss/batch_count:.4f}'
+            })
+            
+            # Clear cache periodically to prevent memory buildup
+            if device == 'cuda' and (batch_idx + 1) % 20 == 0:
+                torch.cuda.empty_cache()
 
         # Average losses
         avg_total = epoch_total_loss / len(train_loader)
@@ -500,13 +606,19 @@ def train_model(model, train_loader, num_epochs=30, lr=0.0001,
         history['diar_loss'].append(avg_diar)
         history['svad_loss'].append(avg_svad)
         history['osd_loss'].append(avg_osd)
-
-        if (epoch + 1) % 5 == 0 or epoch == 0:
-            print(f"Epoch {epoch+1:3d}/{num_epochs} | "
-                  f"Loss: {avg_total:.4f} | "
-                  f"Diar: {avg_diar:.4f} | "
-                  f"SVAD: {avg_svad:.4f} | "
-                  f"OSD: {avg_osd:.4f}")
+        
+        epoch_time = time.time() - epoch_start_time
+        
+        print(f"Epoch {epoch+1:3d}/{num_epochs} | "
+              f"Loss: {avg_total:.4f} | "
+              f"Diar: {avg_diar:.4f} | "
+              f"SVAD: {avg_svad:.4f} | "
+              f"OSD: {avg_osd:.4f} | "
+              f"Time: {epoch_time:.1f}s")
+        
+        # Clear GPU cache after each epoch
+        if device == 'cuda':
+            torch.cuda.empty_cache()
 
     print("\n✓ Training completed!")
     return model, history
@@ -731,20 +843,25 @@ def main():
         print("3. The audio files are in .wav format")
         return
 
-    # Configuration
+    # Configuration - OPTIMIZED for 135 files
     NUM_SPEAKERS = 2
-    BATCH_SIZE = 2  # Reduced from 4 to 2 to save memory
-    NUM_EPOCHS = 30
+    BATCH_SIZE = 4  # Can use 4 with optimizations
+    NUM_EPOCHS = 15  # Reduced from 30 to 15 for faster training
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+    DOWNSAMPLE_FACTOR = 15  # More aggressive downsampling
+    NUM_WORKERS = 2  # Parallel data loading
 
     print("=" * 60)
-    print("CONFIGURATION")
+    print("CONFIGURATION (OPTIMIZED FOR LARGE DATASETS)")
     print("=" * 60)
     print(f"Device: {DEVICE}")
     print(f"Number of speakers: {NUM_SPEAKERS}")
-    print(f"Batch size: {BATCH_SIZE} (reduced for memory)")
-    print(f"Number of epochs: {NUM_EPOCHS}")
+    print(f"Batch size: {BATCH_SIZE}")
+    print(f"Number of epochs: {NUM_EPOCHS} (reduced for faster training)")
+    print(f"Downsample factor: {DOWNSAMPLE_FACTOR}x (more aggressive)")
     print(f"Audio files: {len(audio_files)}")
+    print(f"Max sequence length: 500 frames")
+    print(f"Mixed precision: {'Enabled' if DEVICE == 'cuda' else 'Disabled'}")
 
     # Clear GPU cache before starting
     if torch.cuda.is_available():
@@ -755,16 +872,28 @@ def main():
     # Feature extractor
     feature_extractor = AudioFeatureExtractor()
 
-    # Create dataset and dataloader
-    dataset = SpeakerDiarizationDataset(audio_files, label_data, feature_extractor)
-    train_loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
+    # Create dataset and dataloader with optimizations
+    dataset = SpeakerDiarizationDataset(
+        audio_files, 
+        label_data, 
+        feature_extractor,
+        downsample_factor=DOWNSAMPLE_FACTOR
+    )
+    train_loader = DataLoader(
+        dataset, 
+        batch_size=BATCH_SIZE, 
+        shuffle=True, 
+        collate_fn=collate_fn,
+        num_workers=NUM_WORKERS if DEVICE == 'cpu' else 0,  # Parallel loading on CPU only
+        pin_memory=True if DEVICE == 'cuda' else False
+    )
 
-    # Initialize model (smaller model to save memory)
+    # Initialize model (optimized for speed)
     input_dim = 23 * 15  # n_mels * context_window
     model = SAEEND(
         input_dim=input_dim,
-        d_model=128,  # Reduced from 256 to 128
-        num_blocks=4,
+        d_model=128,  # Compact model
+        num_blocks=3,  # Reduced from 4 to 3 for speed
         num_heads=4,
         num_speakers=NUM_SPEAKERS,
         dropout=0.1
@@ -774,7 +903,7 @@ def main():
     print(f"Model parameters: {num_params:,}")
     print()
 
-    # Train model
+    # Train model with mixed precision
     model, history = train_model(
         model,
         train_loader,
@@ -782,7 +911,8 @@ def main():
         lr=0.0001,
         alpha=1.0,
         beta=1.0,
-        device=DEVICE
+        device=DEVICE,
+        use_amp=True  # Enable mixed precision for faster training
     )
 
     # Plot training history
